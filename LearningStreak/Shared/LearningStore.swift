@@ -9,7 +9,7 @@ enum GoalDuration: String, CaseIterable, Codable, Identifiable {
     var id: String { rawValue }
     var title: String { rawValue.capitalized }
 
-    /// How many logged days complete the goal.
+    /// How many logged days (learned + freezed) complete the goal.
     var totalDays: Int {
         switch self {
         case .week: return 7
@@ -44,10 +44,9 @@ struct AppData: Codable {
     var duration: GoalDuration = .week
     /// Every logged day, keyed "yyyy-MM-dd". Feeds the week strip and the calendar.
     var history: [String: DayStatus] = [:]
-    /// Counters for the current goal.
-    var learnedDays = 0
-    var freezedDays = 0
-    /// Last time a day was logged (or the goal was set).
+    /// The day the current goal started. Only days from here on are counted.
+    var goalStart: Date?
+    /// Last time a day was logged (or the goal was set). Used for the 32-hour rule.
     var lastActionDate: Date?
     var status: GoalStatus = .active
 }
@@ -55,7 +54,7 @@ struct AppData: Codable {
 // MARK: - Store (all the app logic lives here)
 
 final class LearningStore: ObservableObject {
-    /// Streak resets after more than 32 hours without logging Learned or using a Freeze.
+    /// Streak is lost after more than 32 hours without logging Learned or using a Freeze.
     static let streakWindow: TimeInterval = 32 * 60 * 60
 
     @Published private(set) var data: AppData {
@@ -64,7 +63,7 @@ final class LearningStore: ObservableObject {
     /// Refreshed every minute and at 12 AM so "today" is always correct.
     @Published private(set) var now = Date()
 
-    private let storageKey = "LearningStreak.AppData"
+    private let storageKey = "LearningStreak.AppData.v2"
     private let persists: Bool
 
     init() {
@@ -90,24 +89,23 @@ final class LearningStore: ObservableObject {
     var topic: String { data.topic }
     var duration: GoalDuration { data.duration }
     var status: GoalStatus { data.status }
-    var learnedDays: Int { data.learnedDays }
-    var freezedDays: Int { data.freezedDays }
     var maxFreezes: Int { data.duration.maxFreezes }
 
     func status(on date: Date) -> DayStatus? { data.history[AppCalendar.key(date)] }
     var todayStatus: DayStatus? { status(on: now) }
 
-    /// Buttons are disabled if a day is logged. Today's key changes at 12 AM,
-    /// so they are enabled again at 12 AM even if the user logged at 11 PM.
-    var canLogLearned: Bool { data.status == .active && todayStatus == nil }
-
-    /// ...and the Freeze button is also disabled if all Freezes are used.
-    var canFreeze: Bool { canLogLearned && data.freezedDays < maxFreezes }
-
-    var allFreezesUsed: Bool { data.freezedDays >= maxFreezes }
+    /// Counted straight from the calendar, so they can never go below 0
+    /// and always match the coloured days: 0, 1, 2, 3 ...
+    var learnedDays: Int { count(.learned) }
+    var freezedDays: Int { count(.freezed) }
 
     var earliestLoggedDate: Date? {
         data.history.keys.compactMap { AppCalendar.keyFormatter.date(from: $0) }.min()
+    }
+
+    private func count(_ kind: DayStatus) -> Int {
+        let startKey = data.goalStart.map { AppCalendar.key($0) } ?? ""
+        return data.history.filter { $0.key >= startKey && $0.value == kind }.count
     }
 
     // MARK: Task 1 – Start learning
@@ -117,108 +115,68 @@ final class LearningStore: ObservableObject {
         d.hasOnboarded = true
         d.topic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         d.duration = duration
-        startNewStreak(&d)
+        startNewGoal(&d)
         data = d
     }
 
-    // MARK: Task 2 – Log a day as learned or freezed
+    // MARK: Task 2 – Log a day as learned or freezed (toggle)
 
-    func logLearned() {
-        guard canLogLearned else { return }
-        var d = data
-        d.history[AppCalendar.key(Date())] = .learned
-        d.learnedDays += 1          // streak +1
-        d.lastActionDate = Date()
-        checkGoalCompleted(&d)
-        data = d
-    }
-
-    func freezeDay() {
-        guard canFreeze else { return }
-        var d = data
-        d.history[AppCalendar.key(Date())] = .freezed
-        d.freezedDays += 1          // freezed days +1, streak is kept
-        d.lastActionDate = Date()
-        checkGoalCompleted(&d)
-        data = d
-    }
-
-    /// Task 2 toggle: switch today between Learned and Freezed (or nil = undo).
-    /// Switching away from Freezed gives the Freeze back.
+    /// Sets today to Learned, Freezed, or nil (undo).
+    /// Switching between them moves the day from one counter to the other.
     func setToday(_ newStatus: DayStatus?) {
         guard data.status == .active else { return }
         var d = data
         let key = AppCalendar.key(Date())
-        let old = d.history[key]
-        guard old != newStatus else { return }
+        guard d.history[key] != newStatus else { return }
 
-        // Can't freeze if all Freezes are used (unless today is already freezed).
-        if newStatus == .freezed && d.freezedDays >= d.duration.maxFreezes { return }
+        // Can't freeze if all Freezes are used.
+        if newStatus == .freezed && freezedDays >= maxFreezes { return }
 
-        // Take back the old choice
-        switch old {
-        case .learned: d.learnedDays -= 1
-        case .freezed: d.freezedDays -= 1
-        case nil: break
-        }
-
-        // Apply the new choice
-        switch newStatus {
-        case .learned: d.learnedDays += 1
-        case .freezed: d.freezedDays += 1
-        case nil: break
-        }
         d.history[key] = newStatus
         if newStatus != nil { d.lastActionDate = Date() }
-
-        checkGoalCompleted(&d)
         now = Date()
         data = d
+
+        // Reached the goal (e.g. 7 days in a week, learned or freezed) → "Well done!"
+        if learnedDays + freezedDays >= data.duration.totalDays {
+            data.status = .completed
+        }
     }
 
     // MARK: Task 3 / Task 4 – Set new or same goal, change goal
 
-    /// Updating the learning goal resets the streak.
+    /// Updating the learning goal starts the streak over from 0.
     func updateGoal(topic: String, duration: GoalDuration) {
         var d = data
         d.topic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         d.duration = duration
-        startNewStreak(&d)
+        startNewGoal(&d)
         data = d
     }
 
     // MARK: 32-hour rule
 
     /// Call on launch, when the app comes back, every minute, and at 12 AM.
+    /// If more than 32 hours pass without logging → "You didn't reach your goal this time."
     func refresh() {
         now = Date()
         guard data.status == .active,
               let last = data.lastActionDate,
               now.timeIntervalSince(last) > Self.streakWindow else { return }
-
-        var d = data
-        if d.learnedDays + d.freezedDays > 0 {
-            d.status = .missed               // streak lost → Task 3 "goal not met"
-        } else {
-            d.lastActionDate = now           // nothing to lose yet
-        }
-        data = d
+        data.status = .missed
     }
 
     // MARK: Private
 
-    private func startNewStreak(_ d: inout AppData) {
-        d.learnedDays = 0
-        d.freezedDays = 0
+    /// New goal: counters back to 0, today is fresh, the 32-hour clock starts now.
+    /// Old days stay in the calendar (Task 5) but don't count anymore.
+    private func startNewGoal(_ d: inout AppData) {
+        let today = Date()
+        d.history[AppCalendar.key(today)] = nil
+        d.goalStart = AppCalendar.calendar.startOfDay(for: today)
         d.status = .active
-        d.lastActionDate = Date()
-        now = Date()
-    }
-
-    private func checkGoalCompleted(_ d: inout AppData) {
-        if d.learnedDays + d.freezedDays >= d.duration.totalDays {
-            d.status = .completed
-        }
+        d.lastActionDate = today
+        now = today
     }
 
     private func save() {
@@ -258,14 +216,15 @@ extension LearningStore {
             if let d = cal.date(byAdding: .day, value: -offset, to: Date()) { history[AppCalendar.key(d)] = .learned }
             offset += 1
         }
+        // The goal started on the oldest sample day, so the counters match.
+        let start = cal.date(byAdding: .day, value: -(offset - 1), to: cal.startOfDay(for: Date()))
 
         return LearningStore(previewData: AppData(
             hasOnboarded: onboarded,
             topic: onboarded ? "Swift" : "",
             duration: duration,
             history: history,
-            learnedDays: learned,
-            freezedDays: freezed,
+            goalStart: start,
             lastActionDate: Date(),
             status: status))
     }

@@ -77,8 +77,6 @@ extension View {
 struct OrangeCapsuleStyle: ButtonStyle {
     var width: CGFloat? = nil
     var height: CGFloat = 48
-    @Environment(\.isEnabled) private var isEnabled
-
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 17, weight: .medium))
@@ -96,9 +94,9 @@ struct CircleIcon: View {
     let systemName: String
     var body: some View {
         Image(systemName: systemName)
-            .font(.system(size: 17, weight: .medium))
+            .font(.system(size: 22, weight: .medium))   // icon size (was 17)
             .foregroundStyle(Color.primaryText)
-            .frame(width: 44, height: 44)
+            .frame(width: 52, height: 52)               // circle size (was 44)
             .glassBackground(Circle())
     }
 }

@@ -190,7 +190,7 @@ struct LogLearnedCircle: View {
     var body: some View {
         Button(action: action) {
             Text(isLearned ? "Logged as Learned" : "Log as Learned")
-                .font(.system(size: 36, weight: .bold))
+                .font(.system(size: isLearned ? 17 : 36, weight: .bold))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(isLearned ? Color.disabledText : Color.primaryText)
                 .padding(36)
